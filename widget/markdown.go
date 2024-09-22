@@ -1,12 +1,15 @@
 package widget
 
 import (
+	"fmt"
 	"io"
 	"net/url"
 	"strings"
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	east "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/renderer"
 
 	"fyne.io/fyne/v2"
@@ -133,6 +136,55 @@ func renderNode(source []byte, n ast.Node, blockquote bool) ([]RichTextSegment, 
 			u = storage.NewFileURI(dest)
 		}
 		return []RichTextSegment{&ImageSegment{Source: u, Title: string(t.Title), Alignment: fyne.TextAlignCenter}}, nil
+	case *east.TableCell:
+		segs, err := renderChildren(source, n, blockquote)
+		if err != nil {
+			return nil, err
+		}
+		return []RichTextSegment{NewTableCell(NewRichText(segs...))}, nil
+
+	case *east.TableHeader:
+		segs, err := renderChildren(source, n, blockquote)
+		if err != nil {
+			return nil, err
+		}
+		cells := make([]*TableCell, len(segs))
+		for i, seg := range segs {
+			cell, ok := seg.(*TableCell)
+			if !ok {
+				return nil, fmt.Errorf("Unable to cast element %d to TableCell", i)
+			}
+			cells[i] = cell
+		}
+		return []RichTextSegment{&TableRow{cells: cells}}, nil
+	case *east.TableRow:
+		segs, err := renderChildren(source, n, blockquote)
+		if err != nil {
+			return nil, err
+		}
+		cells := make([]*TableCell, len(segs))
+		for i, seg := range segs {
+			cell, ok := seg.(*TableCell)
+			if !ok {
+				return nil, fmt.Errorf("Unable to cast element %d to TableCell", i)
+			}
+			cells[i] = cell
+		}
+		return []RichTextSegment{&TableRow{cells: cells}}, nil
+	case *east.Table:
+		segs, err := renderChildren(source, n, blockquote)
+		if err != nil {
+			return nil, err
+		}
+		rows := make([]*TableRow, len(segs))
+		for i, seg := range segs {
+			row, ok := seg.(*TableRow)
+			if !ok {
+				return nil, fmt.Errorf("Unable to cast element %d to TableCell", i)
+			}
+			rows[i] = row
+		}
+		return []RichTextSegment{NewTableSegment(rows)}, nil
 	}
 	return nil, nil
 }
@@ -148,6 +200,9 @@ func suffixSpaceIfAppropriate(text string, n ast.Node) string {
 func renderChildren(source []byte, n ast.Node, blockquote bool) ([]RichTextSegment, error) {
 	children := make([]RichTextSegment, 0, n.ChildCount())
 	for childCount, child := n.ChildCount(), n.FirstChild(); childCount > 0; childCount-- {
+		if child == nil {
+			continue
+		}
 		segs, err := renderNode(source, child, blockquote)
 		if err != nil {
 			return children, err
@@ -188,10 +243,174 @@ func forceIntoHeadingText(source []byte, n ast.Node) string {
 
 func parseMarkdown(content string) []RichTextSegment {
 	r := markdownRenderer{}
-	md := goldmark.New(goldmark.WithRenderer(&r))
+	md := goldmark.New(
+		goldmark.WithExtensions(extension.Table),
+		goldmark.WithRenderer(&r))
 	err := md.Convert([]byte(content), nil)
 	if err != nil {
 		fyne.LogError("Failed to parse markdown", err)
 	}
 	return r
+}
+
+type (
+	DummyRichTextSegment struct{}
+	TableCell            struct {
+		BaseWidget
+		DummyRichTextSegment
+		content  *RichText
+		renderer cellRenderer
+	}
+	TableRow struct {
+		DummyRichTextSegment
+		cells []*TableCell
+	}
+	TableSegment struct {
+		Table
+		DummyRichTextSegment
+		rows []*TableRow
+		size fyne.Size
+	}
+)
+
+// DummyRichTextSegment is used by TableRow and TableCell to conform with RichTextSegment.
+func (c *DummyRichTextSegment) Inline() bool                    { return false }
+func (c *DummyRichTextSegment) Textual() string                 { panic("not implemented") }
+func (c *DummyRichTextSegment) Update(fyne.CanvasObject)        { panic("not implemented") }
+func (c *DummyRichTextSegment) Visual() fyne.CanvasObject       { panic("not implemented") }
+func (c *DummyRichTextSegment) Select(pos1, pos2 fyne.Position) { panic("not implemented") }
+func (c *DummyRichTextSegment) SelectedText() string            { panic("not implemented") }
+func (c *DummyRichTextSegment) Unselect()                       { panic("not implemented") }
+
+// Cell implements CreateRenderer and draw the underlaying RichTextSegments using RichText.
+func (c *TableCell) CreateRenderer() fyne.WidgetRenderer {
+	return c.renderer
+}
+
+func NewTableCell(content *RichText) *TableCell {
+	cell := &TableCell{
+		content:  content,
+		renderer: NewCellRenderer(content),
+	}
+	cell.ExtendBaseWidget(cell)
+	return cell
+}
+
+func (c *TableCell) updateSegment(content *RichText) {
+	c.content = content
+	c.renderer.setObject(c.content)
+}
+
+func NewTableSegment(rows []*TableRow) *TableSegment {
+	length := func() (int, int) {
+		if len(rows) > 0 {
+			return len(rows), len(rows[0].cells)
+		}
+		return 0, 0
+	}
+	create := func() fyne.CanvasObject {
+		return NewTableCell(NewRichText(&TextSegment{}))
+	}
+	update := func(pos TableCellID, o fyne.CanvasObject) {
+		if pos.Row >= len(rows) || pos.Col >= len(rows[pos.Row].cells) {
+			return
+		}
+		cell := o.(*TableCell)
+		cell.updateSegment(rows[pos.Row].cells[pos.Col].content)
+	}
+	table := &TableSegment{
+		Table: Table{
+			Length:     length,
+			CreateCell: create,
+			UpdateCell: update,
+		},
+		rows: rows,
+	}
+	table.ExtendBaseWidget(table)
+	table.resize()
+	return table
+}
+
+func (l *TableSegment) resize() {
+	// Compute the size of the columns and rows
+	widths := []float32{}
+	heights := []float32{}
+	for i, row := range l.rows {
+		for j, cell := range row.cells {
+			width := cell.content.MinSize().Width
+			height := cell.content.MinSize().Height
+			if len(heights) < i+1 {
+				heights = append(heights, height)
+			} else if heights[i] < height {
+				heights[i] = height
+			}
+			if len(widths) < j+1 {
+				widths = append(widths, width)
+			} else if widths[j] < width {
+				widths[j] = width
+			}
+		}
+	}
+	l.size.Height = 0
+	for i, height := range heights {
+		l.SetRowHeight(i, height)
+		l.size.Height += height + 4
+	}
+	l.size.Width = 0
+	for j, width := range widths {
+		l.SetColumnWidth(j, width+8)
+		l.size.Width += width + 16
+	}
+}
+
+func (l *TableSegment) Unselect()                       { panic("not implemented") }
+func (l *TableSegment) Select(pos1, pos2 fyne.Position) { panic("not implemented") }
+func (l *TableSegment) SelectedText() string            { panic("not implemented") }
+
+// MinSize returns the table size otherwise is it minimzed.
+func (l *TableSegment) MinSize() fyne.Size {
+	return l.size
+}
+
+// Visual returns the graphical elements required to render this segment.
+func (l *TableSegment) Visual() fyne.CanvasObject {
+	return l
+}
+
+// Update applies the current state of this table segment to an existing visual.
+func (l *TableSegment) Update(o fyne.CanvasObject) {}
+
+// cellRenderer implements fyne.WidgetRenderer. It contains exactly one canvas object.
+type cellRenderer []fyne.CanvasObject
+
+func NewCellRenderer(object fyne.CanvasObject) cellRenderer {
+	return cellRenderer([]fyne.CanvasObject{object})
+}
+
+func (r cellRenderer) setObject(object fyne.CanvasObject) {
+	r[0] = object
+}
+
+// Destroy does nothing in this implementation.
+func (r cellRenderer) Destroy() {
+}
+
+// Layout updates the contained object to be the requested size.
+func (r cellRenderer) Layout(s fyne.Size) {
+	r[0].Resize(s)
+}
+
+// MinSize returns the smallest size that this render can use, returned from the underlying object.
+func (r cellRenderer) MinSize() fyne.Size {
+	return r[0].MinSize()
+}
+
+// Objects returns the objects that should be rendered.
+func (r cellRenderer) Objects() []fyne.CanvasObject {
+	return r
+}
+
+// Refresh requests the underlying object to redraw.
+func (r cellRenderer) Refresh() {
+	r[0].Refresh()
 }
